@@ -57,24 +57,42 @@ defmodule Nerves.Firmware.HTTP.Transport do
     stage_file  = Application.get_env(:nerves_firmware_http, :stage_file,
                                       "/tmp/uploaded.fw")
     Logger.info "receiving firmware"
-    File.open!(stage_file, [:write], &(stream_fw &1, req))
+    resp = File.open!(stage_file, [:write], &(stream_fw &1, req))
     Logger.info "firmware received"
 
-    response = case Nerves.Firmware.upgrade_and_finalize(stage_file) do
-      {:error, _reason} ->
+    with {:done, req, content_hash} <- resp,
+         {:ok, req} <- verify_signature(req, content_hash)
+    do
+      resp =
+        stage_file
+        |> Nerves.Firmware.upgrade_and_finalize()
+        |> process_upgrade_result(req, state)
+      File.rm stage_file
+      resp
+    else
+      {:error, :verification_failed, req} ->
+        File.rm stage_file
+        {:halt, reply_with(401, req), state}
+      error ->
+        Logger.error(IO.inspect(error))
+        File.rm stage_file
         {:halt, reply_with(400, req), state}
-      :ok ->
-        case :cowboy_req.header("x-reboot", req) do
-          {:undefined, _} ->  nil
-          {_, _} ->
-            reply_with(200, req)
-            Nerves.Firmware.reboot
-        end
-        {true, req, state}
     end
-    File.rm stage_file
-    response
   end
+
+  defp process_upgrade_result(:ok, req, state) do
+    if reboot?(:cowboy_req.header("x-reboot", req)) do
+      reply_with(200, req)
+      Nerves.Firmware.reboot()
+    end
+    {true, req, state}
+  end
+  defp process_upgrade_result({:error, _}, req, state) do
+    {:halt, reply_with(400, req), state}
+  end
+
+  defp reboot?({:undefined, _}), do: false
+  defp reboot?({_, _}), do: true
 
   # helper to return errors to requests from cowboy more easily
   defp reply_with(code, req) do
@@ -83,19 +101,49 @@ defmodule Nerves.Firmware.HTTP.Transport do
   end
 
   # copy from a cowboy req into a IO.Stream
-  defp stream_fw(f, req, count \\ 0) do
+  defp stream_fw(f, req), do: stream_fw(f, req, 0, :crypto.hash_init(:sha256))
+  defp stream_fw(_f, _req, count, _hctxt) when count > @max_upload_size do
+    {:error, :too_large}
+  end
+  defp stream_fw(f, req, count, hctxt) do
     #  send an event about (bytes_uploaded: count)
-    if count > @max_upload_size do
-      {:error, :too_large}
-    else
-      case :cowboy_req.body(req, [:length, @max_upload_chunk]) do
-        {:more, chunk, new_req} ->
-          :ok = IO.binwrite f, chunk
-          stream_fw(f, new_req, (count + byte_size(chunk)))
-        {:ok, chunk, new_req} ->
-          :ok = IO.binwrite f, chunk
-          {:done, new_req}
+    case :cowboy_req.body(req, length: @max_upload_chunk) do
+      {:more, chunk, new_req} ->
+        :ok = IO.binwrite f, chunk
+        hctxt = :crypto.hash_update(hctxt, chunk)
+        stream_fw(f, new_req, (count + byte_size(chunk)), hctxt)
+      {:ok, chunk, new_req} ->
+        :ok = IO.binwrite f, chunk
+        content_hash =
+          hctxt
+          |> :crypto.hash_update(chunk)
+          |> :crypto.hash_final()
+          |> Base.encode16(case: :lower)
+        {:done, new_req, content_hash}
+    end
+  end
+
+  defp verify_signature(req, content_hash) do
+    protected? = Application.get_env(:nerves_firmware_http, :secret) != nil
+    if protected? do
+      {rp, req} = :cowboy_req.path(req)
+      {md, req} = :cowboy_req.method(req)
+      {qs, req} = :cowboy_req.qs(req)
+      {hd, req} = :cowboy_req.headers(req)
+
+      result = Sigaws.verify(rp, method: md, query_string: qs, headers: hd,
+                             body: {:content_hash, content_hash},
+                             provider: Nerves.Firmware.HTTP.SigProvider)
+      case result do
+        {:ok, _} ->
+          Logger.info "sigaws result = #{inspect result}"
+          {:ok, req}
+        {:error, _, _} ->
+          Logger.error "sigaws result = #{inspect result}"
+          {:error, :verification_failed, req}
       end
+    else
+      {:ok, req}
     end
   end
 end
